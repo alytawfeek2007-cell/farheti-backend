@@ -11,21 +11,35 @@ https://docs.djangoproject.com/en/6.1/ref/settings/
 """
 
 from pathlib import Path
+from datetime import timedelta  # NEW — needed for SIMPLE_JWT lifetimes below
+
+import environ
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+env = environ.Env(
+    DEBUG=(bool, False),
+)
+environ.Env.read_env(BASE_DIR / '.env')
 
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'REDACTED_SECRET_KEY'
+SECRET_KEY = env('SECRET_KEY')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = env('DEBUG')
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = env.list('ALLOWED_HOSTS', default=[])
+
+# How many reverse proxies sit in front of this app. 0 is correct for
+# local dev (no proxy) — set this to the real proxy count in production.
+# This value is only meaningful once it's also passed into REST_FRAMEWORK
+# below — DRF does NOT read a top-level NUM_PROXIES setting on its own.
+NUM_PROXIES = env.int('NUM_PROXIES', default=0)
 
 
 # Application definition
@@ -37,13 +51,17 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'corsheaders',
     'rest_framework',
-    'rest_framework.authtoken',
+    'rest_framework_simplejwt.token_blacklist',  # NEW — required for logout/blacklisting
     'core',
+    # CHANGED — 'rest_framework.authtoken' removed: you're off authtoken now, JWT replaces it
 ]
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',    
+    'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -78,11 +96,35 @@ WSGI_APPLICATION = 'farheti_backend.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'farheti_db',
-        'USER': 'postgres',
-        'PASSWORD': 'REDACTED_PASSWORD',
-        'HOST': 'localhost',
-        'PORT': '5432',
+        'NAME': env('DB_NAME', default='farheti_db'),
+        'USER': env('DB_USER', default='postgres'),
+        'PASSWORD': env('DB_PASSWORD'),
+        'HOST': env('DB_HOST', default='localhost'),
+        'PORT': env('DB_PORT', default='5432'),
+    }
+}
+
+
+# Cache
+# Used for DRF throttling. DatabaseCache (not LocMemCache) so counters are
+# shared across every worker process. MAX_ENTRIES raised well above the
+# Django default (300) so counters aren't culled under normal load —
+# each unique throttled client/user is one entry.
+#
+# KNOWN LIMITATION, accepted for now: DatabaseCache's get-then-set is not
+# atomic, so concurrent requests can undercount hits during a genuine
+# burst. Not worth fixing via more tuning — the real fix is Redis
+# (atomic INCR), which should replace this before real concurrent
+# traffic/launch, not before.
+
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
+        'LOCATION': 'throttle_cache_table',
+        'OPTIONS': {
+            'MAX_ENTRIES': 100000,
+            'CULL_FREQUENCY': 10,
+        },
     }
 }
 
@@ -111,7 +153,7 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LANGUAGE_CODE = 'en-us'
 
-TIME_ZONE = 'UTC'
+TIME_ZONE = 'Africa/Cairo'
 
 USE_I18N = True
 
@@ -122,13 +164,184 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.1/howto/static-files/
 
 STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 
 # Email
 # https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration
 
-MAILERS = {
-    'default': {
-        'BACKEND': 'django.core.mail.backends.console.EmailBackend',
+# Email (Django 6.1 MAILERS). Console backend when EMAIL_HOST is empty (dev); SMTP otherwise.
+# Local underscore names on purpose: defining EMAIL_HOST etc. as settings is deprecated in 6.1.
+_smtp_host = env('EMAIL_HOST', default='')
+if _smtp_host:
+    _smtp_options = {
+        'host': _smtp_host,
+        'port': env.int('EMAIL_PORT', default=587),
+        'username': env('EMAIL_HOST_USER', default=''),
+        'password': env('EMAIL_HOST_PASSWORD', default=''),
+        'timeout': 10,  # mail is sent inside the request; never let a dead SMTP server hang a worker
+    }
+    if env.bool('EMAIL_USE_SSL', default=False):
+        _smtp_options['use_ssl'] = True
+    else:
+        _smtp_options['use_tls'] = env.bool('EMAIL_USE_TLS', default=True)
+    MAILERS = {
+        'default': {
+            'BACKEND': 'django.core.mail.backends.smtp.EmailBackend',
+            'OPTIONS': _smtp_options,
+        },
+    }
+else:
+    MAILERS = {
+        'default': {'BACKEND': 'django.core.mail.backends.console.EmailBackend'},
+    }
+
+DEFAULT_FROM_EMAIL = env('DEFAULT_FROM_EMAIL', default='Farheti <noreply@farheti.local>')
+# Base URL of the frontend; the links in emails point here.
+FRONTEND_BASE_URL = env('FRONTEND_BASE_URL', default='http://127.0.0.1:5000').rstrip('/')
+# Who gets the stuck-refund alert (comma-separated in .env).
+OWNER_ALERT_EMAILS = env.list('OWNER_ALERT_EMAILS', default=[])
+# Password-reset links live for one hour (Django's default is three days).
+PASSWORD_RESET_TIMEOUT = 3600
+
+MEDIA_URL = '/media/'
+MEDIA_ROOT = BASE_DIR / 'media'
+
+
+# CORS
+# https://github.com/adamchainz/django-cors-headers
+# The localhost default only applies in DEBUG. In production, a missing
+# CORS_ALLOWED_ORIGINS env var now means CORS blocks everything (fails
+# loud) instead of silently falling back to a dev machine's address.
+# SessionAuthentication (below) stays DEBUG-only too, so in production
+# only JWTAuthentication is live and CSRF-trusted-origins is a non-issue.
+
+CORS_ALLOWED_ORIGINS = env.list(
+    'CORS_ALLOWED_ORIGINS',
+    default=['http://127.0.0.1:5000'] if DEBUG else [],
+)
+
+
+# Django REST Framework
+# https://www.django-rest-framework.org/api-guide/settings/
+
+# CHANGED — TokenAuthentication replaced with JWTAuthentication
+_authentication_classes = ['rest_framework_simplejwt.authentication.JWTAuthentication']
+if DEBUG:
+    # SessionAuthentication only earns its keep alongside the browsable
+    # API for local testing; it serves nothing in production once the
+    # browsable renderer is off, and just adds an extra cookie+CSRF auth
+    # path with no consumer.
+    _authentication_classes.append('rest_framework.authentication.SessionAuthentication')
+
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': _authentication_classes,
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.IsAuthenticated',
+    ],
+    'DEFAULT_PARSER_CLASSES': [
+        'core.parsers.StrictJSONParser',
+    ],
+    'DEFAULT_RENDERER_CLASSES': (
+        [
+            'rest_framework.renderers.JSONRenderer',
+            'rest_framework.renderers.BrowsableAPIRenderer',
+        ]
+        if DEBUG
+        else ['rest_framework.renderers.JSONRenderer']
+    ),
+    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    'PAGE_SIZE': 20,
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': '60/min',
+        'user': '300/min',
+        'login': '5/min',
+        'message_send': '20/min',
+        'payment_init': '10/min',      # NEW — POST /bookings/<id>/pay/
+        'payment_refund': '10/min',    # NEW — POST /bookings/<id>/cancel-and-refund/
+        'paymob_webhook': '600/min',   # NEW — Paymob server-to-server callback
+        'password_reset': '10/hour',
+        'password_reset_confirm': '20/hour',
+        'email_verify': '20/hour',
+        'email_resend': '5/hour',        
+    },
+    # Must live here, not as a bare top-level Django setting — DRF's
+    # ProxyThrottleMixin reads it from REST_FRAMEWORK specifically.
+    # Without this, DRF's default (None) trusts the full X-Forwarded-For
+    # header, letting any client spoof a fresh IP per request and bypass
+    # AnonRateThrottle entirely.
+    'NUM_PROXIES': NUM_PROXIES,
+}
+
+
+# Simple JWT
+# https://django-rest-framework-simplejwt.readthedocs.io/
+
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=15),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
+    'ROTATE_REFRESH_TOKENS': True,
+    'BLACKLIST_AFTER_ROTATION': True,
+}
+
+
+# Paymob (card payments). Values come from .env; see the Paymob dashboard.
+PAYMOB_SECRET_KEY = env('PAYMOB_SECRET_KEY', default='')
+PAYMOB_PUBLIC_KEY = env('PAYMOB_PUBLIC_KEY', default='')
+PAYMOB_HMAC_SECRET = env('PAYMOB_HMAC_SECRET', default='')
+PAYMOB_CARD_INTEGRATION_ID = env('PAYMOB_CARD_INTEGRATION_ID', default='0')
+PAYMOB_BASE_URL = env('PAYMOB_BASE_URL', default='https://accept.paymob.com')
+PAYMOB_CHECKOUT_URL = env('PAYMOB_CHECKOUT_URL', default='https://eg.checkout.paymob.com')
+PAYMOB_NOTIFICATION_URL = env('PAYMOB_NOTIFICATION_URL', default='')
+PAYMOB_REDIRECTION_URL = env('PAYMOB_REDIRECTION_URL', default='')
+
+# Logging: everything goes to the console, which is where PaaS/VPS hosts collect logs.
+# 'farheti' covers farheti.jobs and farheti.payments (stuck-refund alerts at CRITICAL).
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'simple': {'format': '%(asctime)s %(levelname)s %(name)s: %(message)s'},
+    },
+    'handlers': {
+        'console': {'class': 'logging.StreamHandler', 'formatter': 'simple'},
+    },
+    'root': {'handlers': ['console'], 'level': 'WARNING'},
+    'loggers': {
+        'farheti': {'handlers': ['console'], 'level': 'INFO', 'propagate': False},
     },
 }
+
+# Production-only HTTPS and cookie security
+if not DEBUG:
+    # The host's proxy terminates HTTPS and tells Django via this header.
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    SECURE_SSL_REDIRECT = env.bool('SECURE_SSL_REDIRECT', default=True)
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    # Start low so a mistake is not locked into browsers; raise after launch.
+    SECURE_HSTS_SECONDS = env.int('SECURE_HSTS_SECONDS', default=3600)
+
+# Pre-launch safety check: in production, refuse to start if key settings are missing.
+if not DEBUG:
+    _problems = []
+    if not ALLOWED_HOSTS:
+        _problems.append('ALLOWED_HOSTS is empty')
+    if not CORS_ALLOWED_ORIGINS:
+        _problems.append('CORS_ALLOWED_ORIGINS is empty')
+    if not _smtp_host:
+        _problems.append('EMAIL_HOST is empty (emails would not be sent)')
+    if DEFAULT_FROM_EMAIL.strip().lower().endswith(('.local', '.local>')):
+        _problems.append('DEFAULT_FROM_EMAIL still uses .local')
+    if not OWNER_ALERT_EMAILS:
+        _problems.append('OWNER_ALERT_EMAILS is empty')
+    if FRONTEND_BASE_URL.startswith('http://127.0.0.1') or FRONTEND_BASE_URL.startswith('http://localhost'):
+        _problems.append('FRONTEND_BASE_URL points to localhost')
+    if not PAYMOB_SECRET_KEY or not PAYMOB_HMAC_SECRET:
+        _problems.append('Paymob keys are missing')
+    if _problems:
+        raise RuntimeError('Production settings incomplete: ' + '; '.join(_problems))
